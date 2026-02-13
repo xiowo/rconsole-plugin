@@ -238,7 +238,7 @@ export class tools extends plugin {
                     fnc: "freyr"
                 },
                 {
-                    reg: "(^#总结一下\s*(http|https):\/\/.*|mp.weixin.qq.com|arxiv.org|sspai.com|chinadaily.com.cn|zhihu.com|github.com)",
+                    reg: "(^#总结一下\s*(http|https):\/\/.*|mp.weixin.qq.com|arxiv.org|sspai.com|chinadaily.com.cn|zhihu.com)",
                     fnc: "linkShareSummary"
                 },
                 {
