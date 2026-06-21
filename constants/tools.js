@@ -277,7 +277,7 @@ export const ANIME_SERIES_SEARCH_LINK2 = "https://yhdm.one/search?q=";
  * HIBI API
  * @type {string}
  */
-export const HIBI_API_SERVICE = "http://0d00.us.kg:8080/api";
+export const HIBI_API_SERVICE = "http://115.120.205.58:8080/api"; // 感谢群友: 非酋和东京湾的老船长提供的服务器
 
 /**
  * 小黑盒帖子API
@@ -302,18 +302,6 @@ export const XHH_CONSOLE_LINK = "https://api.xiaoheihe.cn/game/console/get_game_
  * @type {string}
  */
 export const XHH_MOBILE_LINK = "https://api.xiaoheihe.cn/game/mobile/get_game_detail";
-
-/**
- * 临时 AI LLM爬虫
- * @type {string}
- */
-export const PearAPI_CRAWLER = "https://api.pearktrue.cn/api/llmreader/?url={}&type=json";
-
-/**
- * 临时 AI 总结
- * @type {string}
- */
-export const PearAPI_DEEPSEEK = "https://api.pearktrue.cn/api/deepseek/";
 
 /**
  * TOOL_CALL 爬虫工具

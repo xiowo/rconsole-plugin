@@ -102,6 +102,12 @@ export const TWITTER_BEARER_TOKEN = "";
 export const BILI_DEFAULT_INTRO_LEN_LIMIT = 50;
 
 /**
+ * 小红书描述默认长度限制
+ * @type {number}
+ */
+export const XHS_DESC_LEN_LIMIT = 78;
+
+/**
  * 总结的prompt
  * @type {string}
  */
@@ -160,7 +166,8 @@ export const SUMMARY_CONTENT_ESTIMATOR_PATTERNS = [
     { reg: /(?:https?:\/\/)?www\.bilibili\.com\/read\/[A-Za-z\d._?%&+\-=\/#]*/, name: '哔哩哔哩专栏' },
     { reg: /(?:https?:\/\/)?www\.zhihu\.com\/question\/[A-Za-z\d._?%&+\-=\/#]*/, name: '知乎问题' },
     { reg: /(?:https?:\/\/)?(www\.)chinadaily.com.cn\/a\/[a-zA-Z0-9\d._?%&+\-=\/#]*/, name: 'ChinaDaily' },
-    { reg: /(?:https?:\/\/)?(www\.)?github.com\/[a-zA-Z0-9\d._?%&+\-=\/#]*/, name: 'Github' }
+    { reg: /(?:https?:\/\/)?(www\.)?github.com\/[a-zA-Z0-9\d._?%&+\-=\/#]*/, name: 'Github' },
+    { reg: /(?:https?:\/\/)?(www\.)?v2ex.com\/t\/[A-Za-z0-9\d._?%&+\-=\/#]*/, name: 'V2EX' }
 ];
 
 const BILI_CDN_TEMPLATE = "upos-sz-mirror{}.bilivideo.com";
@@ -226,10 +233,14 @@ export const DOUYIN_BGM_SEND_TYPE = Object.freeze([
 ]);
 
 export const YOUTUBE_GRAPHICS_LIST = Object.freeze([
-    { label: 'Best', value: 0 },
+    { label: '最高画质 不限', value: 0 },
+    { label: '8K 极清', value: 4320 },
+    { label: '4K 超清', value: 2160 },
+    { label: '2K 2k', value: 1440 },
     { label: '1080P 高清', value: 1080 },
     { label: '720P 高清', value: 720 },
     { label: '480P 清晰', value: 480 },
+    { label: '360P 流畅', value: 360 },
 ]);
 
 export const NETEASECLOUD_QUALITY_LIST = Object.freeze([

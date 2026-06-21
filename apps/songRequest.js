@@ -54,11 +54,6 @@ export class songRequest extends plugin {
                     reg: '^#?清除云盘缓存$',
                     fnc: 'cleanCloudData',
                     permission: 'master'
-                },
-                {
-                    reg: '^#?文件上传云盘$|#?群文件上传云盘$|#rngu|#RNGU',
-                    fnc: 'getLatestDocument',
-                    permission: 'master'
                 }
             ]
         });
@@ -111,9 +106,12 @@ export class songRequest extends plugin {
             // 获取云盘歌单列表
             const cloudSongList = await this.getCloudSong()
             // 搜索云盘歌单并进行搜索
-            const matchedSongs = cloudSongList.filter(({ songName, singerName }) =>
-                songName.includes(songKeyWord) || singerName.includes(songKeyWord) || songName == songKeyWord || singerName == songKeyWord
-            );
+            const searchKeyword = songKeyWord.trim().toLowerCase();
+            const matchedSongs = cloudSongList.filter(({ songName, singerName }) => {
+                const nameMatch = songName && songName.toLowerCase().includes(searchKeyword);
+                const singerMatch = singerName && singerName.toLowerCase().includes(searchKeyword);
+                return nameMatch || singerMatch;
+            });
             // 计算列表数
             let songListCount = matchedSongs.length >= this.songRequestMaxList ? this.songRequestMaxList : matchedSongs.length
             let searchCount = this.songRequestMaxList - songListCount
@@ -122,7 +120,9 @@ export class songRequest extends plugin {
                     'id': matchedSongs[i].id,
                     'songName': matchedSongs[i].songName,
                     'singerName': matchedSongs[i].singerName,
-                    'duration': matchedSongs[i].duration
+                    'duration': matchedSongs[i].duration,
+                    'type': matchedSongs[i].type,
+                    'cover': matchedSongs[i].cover || 'def'
                 });
             }
             let searchUrl;
@@ -166,7 +166,7 @@ export class songRequest extends plugin {
                     } catch (error) {
                         logger.info('并未获取云服务歌曲')
                     }
-                    const songIds = musicDate.data.filter(item => item.type !== 'podcast').map(item => item.id).join(',');
+                    const songIds = musicDate.data.filter(item => item.type !== 'podcast' && item.type !== 'cloud').map(item => item.id).join(',');
                     if (songIds) {
                         detailUrl = detailUrl.replace("{}", songIds)
                         await axios.get(detailUrl, {
@@ -224,7 +224,7 @@ export class songRequest extends plugin {
                 const songWikiUrl = autoSelectNeteaseApi + '/song/wiki/summary?id=' + songId;
                 const statusUrl = autoSelectNeteaseApi + '/login/status'; //用户状态API
                 // 判断选中的歌曲是否来自云盘
-                const isCloudSong = selectedSong.duration === '云盘';
+                const isCloudSong = selectedSong.type === 'cloud';
                 // 检查 Cookie 有效性，根据歌曲来源选择 Cookie 类型
                 const isCkExpired = await this.checkCooike(statusUrl, isCloudSong ? 'cloud' : 'song');
                 // 请求netease数据并播放
@@ -351,9 +351,9 @@ export class songRequest extends plugin {
             musicUrlReg.exec(msgData)?.[2] ||
             musicUrlReg3.exec(msgData)?.[2] ||
             /(?<!user)id=(\d+)/.exec(msgData)?.[1] || "";
-        let title = msgData.match(/"title":"([^"]+)"/)?.[1]
-        let desc = msgData.match(/"desc":"([^"]+)"/)?.[1]
-        const jumpUrl = msgData.match(/"jumpUrl":"([^"]+)"/)?.[1];
+        let title = msgData.match(/"title":\s*"([^"]+)"/)?.[1]
+        let desc = msgData.match(/"desc":\s*"([^"]+)"/)?.[1]
+        const jumpUrl = msgData.match(/"jumpUrl":\s*"([^"]+)"/)?.[1];
         const isPodcast = /dj\?id=/.test(jumpUrl);
         if (id === "") return
         if (isPodcast) {
@@ -370,10 +370,27 @@ export class songRequest extends plugin {
                 return;
             }
         }
-        let path = this.getCurDownloadPath(e) + '/' + desc + '-' + title + '.' + FileSuffix
-        const fileExists = await this.waitForFile(path, e);
+        let path = this.getCurDownloadPath(e) + '/' + desc + '-' + title + '.' + FileSuffix;
+        let fileExists = await checkFileExists(path);
+
         if (!fileExists) {
-            return;
+            logger.mark(`[R插件][上传群文件] 未检测到本地文件，尝试自动下载...`);
+            const AUTO_NETEASE_SONG_DOWNLOAD = autoSelectNeteaseApi + "/song/url/v1?id=" + id + "&level=" + this.neteaseCloudAudioQuality;
+            try {
+                const resp = await axios.get(AUTO_NETEASE_SONG_DOWNLOAD, {
+                    headers: {
+                        "User-Agent": COMMON_USER_AGENT,
+                        "Cookie": this.getCookie(false)
+                    }
+                });
+                let url = resp.data.data?.[0]?.url;
+                let musicExt = resp.data.data?.[0]?.type || FileSuffix;
+                path = await downloadAudio(url, this.getCurDownloadPath(e), desc + '-' + title, 'follow', musicExt);
+            } catch (err) {
+                logger.error('获取歌曲下载链接失败', err);
+                e.reply('获取歌曲下载链接失败，无法上传');
+                return;
+            }
         }
         try {
             // 上传群文件
@@ -387,49 +404,136 @@ export class songRequest extends plugin {
 
     // 上传云盘
     async uploadCloud(e) {
-        let msg = await getReplyMsg(e)
+        const autoSelectNeteaseApi = await this.pickApi()
+        let uploadFilePath = null;
+        let matchSongId = null;
+        let msg = null;
+
+        if (e.message?.[0]?.type === 'reply') {
+            msg = await getReplyMsg(e);
+        }
         // 检查消息数据有效性
         const msgData = msg?.message?.[0]?.data?.data;
         if (!msgData) {
-            e.reply('请回复一条网易云音乐卡片消息再使用此命令');
-            return;
-        }
-        const autoSelectNeteaseApi = await this.pickApi()
-        const musicUrlReg = /(http:|https:)\/\/music.163.com\/song\/media\/outer\/url\?id=(\d+)/;
-        const musicUrlReg2 = /(http:|https:)\/\/y.music.163.com\/m\/song\?(.*)&id=(\d+)/;
-        const musicUrlReg3 = /(http:|https:)\/\/music.163.com\/m\/song\/(\d+)/;
-        let id =
-            musicUrlReg2.exec(msgData)?.[3] ||
-            musicUrlReg.exec(msgData)?.[2] ||
-            musicUrlReg3.exec(msgData)?.[2] ||
-            /(?<!user)id=(\d+)/.exec(msgData)?.[1] || "";
-        let title = msgData.match(/"title":"([^"]+)"/)?.[1]
-        let desc = msgData.match(/"desc":"([^"]+)"/)?.[1]
-        const jumpUrl = msgData.match(/"jumpUrl":"([^"]+)"/)?.[1];
-        const isPodcast = /dj\?id=/.test(jumpUrl);
-        if (id === "") return
-        if (isPodcast) {
-            const programDetailUrl = `${autoSelectNeteaseApi}/dj/program/detail?id=${id}`;
-            try {
-                const programRes = await axios.get(programDetailUrl);
-                const mainSong = programRes.data.program.mainSong;
-                id = mainSong.id;
-                title = mainSong.name;
-                desc = mainSong.artists[0].name || '喵喵~';
-            } catch (error) {
-                logger.error('出现错误，无法上传', error);
-                e.reply('出现错误，无法上传');
+            // 没有匹配到卡片消息数据 使用群文件上传逻辑
+            const result = await getGroupFileUrl(e);
+            if (!result || !result.cleanPath) {
+                e.reply('请回复一条网易云音乐卡片消息，或在发送音频文件后使用此命令');
                 return;
             }
+
+            let { cleanPath, file_id, fileName: extractedFileName, fileFormat: extractedFormat } = result;
+            // NapCat 和 LLBot 解决方案
+            if (cleanPath.startsWith("https")) {
+                const songName = extractedFileName || file_id.match(/\.(.*?)\.(\w+)$/)?.[1];
+                const format = extractedFormat || file_id.match(/\.(.*?)\.(\w+)$/)?.[2];
+                const path = `${this.getCurDownloadPath(e)}/${songName}.${format}`;
+                // 检测文件是否存在 已提升性能
+                if (await checkFileExists(path)) {
+                    // 如果文件已存在
+                    logger.mark(`[R插件][云盘] 上传路径审计：已存在下载文件`);
+                    cleanPath = path;
+                } else {
+                    // 如果文件不存在
+                    logger.mark(`[R插件][云盘] 上传路径审计：不存在下载文件，将进行下载...`);
+                    cleanPath = await downloadAudio(cleanPath, this.getCurDownloadPath(e), songName, "manual", format);
+                }
+            }
+            logger.info(`[R插件][云盘] 上传路径审计： ${cleanPath}`);
+            // 使用 splitPaths 提取信息
+            const [{ dir: dirPath, fileName, extension, baseFileName }] = splitPaths(cleanPath);
+            // 文件名拆解为两部分
+            const parts = baseFileName.trim().match(/^([\s\S]+)\s*-\s*([\s\S]+)$/);
+            // 命令不规范检测
+            if (parts == null || parts.length < 2) {
+                logger.warn("[R插件][云盘] 上传路径审计：命名不规范");
+                e.reply("请规范上传文件的命名：歌手-歌名，例如：梁静茹-勇气");
+                return true;
+            }
+            // 直接提取歌手和歌名
+            const title = parts[2].replace(/^\s+|\s+$/g, '');
+            const artist = parts[1].replace(/^\s+|\s+$/g, '');
+            // 规范化拼接出：歌手-歌名.后缀（去掉可能存在的多余空格）
+            const normalizedFileName = `${dirPath}/${artist}-${title}${extension}`;
+            const tags = {
+                title: title,
+                artist: artist
+            };
+            // 写入元数据
+            let success = NodeID3.write(tags, cleanPath); // 如果不是mp3可能会有问题？需要测试 暂时先摸了
+            if (success) logger.info('[R插件][云盘] 写入元数据成功');
+            // 重命名为规范的 歌手-歌名 格式
+            if (cleanPath !== normalizedFileName) {
+                if (fs.existsSync(normalizedFileName)) {
+                    fs.unlinkSync(normalizedFileName);
+                }
+                fs.renameSync(cleanPath, normalizedFileName);
+            }
+
+            uploadFilePath = normalizedFileName;
+        } else {
+            // 解析卡片消息数据
+            const musicUrlReg = /(http:|https:)\/\/music\.163\.com\/song\/media\/outer\/url\?id=(\d+)/;
+            const musicUrlReg2 = /(http:|https:)\/\/y\.music\.163\.com\/m\/song\?(.*)&id=(\d+)/;
+            const musicUrlReg3 = /(http:|https:)\/\/music\.163\.com\/m\/song\/(\d+)/;
+            let id =
+                musicUrlReg2.exec(msgData)?.[3] ||
+                musicUrlReg.exec(msgData)?.[2] ||
+                musicUrlReg3.exec(msgData)?.[2] ||
+                /(?<!user)id=(\d+)/.exec(msgData)?.[1] || "";
+            let title = msgData.match(/"title":\s*"([^"]+)"/)?.[1]
+            let desc = msgData.match(/"desc":\s*"([^"]+)"/)?.[1]
+            const jumpUrl = msgData.match(/"jumpUrl":\s*"([^"]+)"/)?.[1];
+            const isPodcast = /dj\?id=/.test(jumpUrl);
+            if (id === "") return
+            if (isPodcast) {
+                const programDetailUrl = `${autoSelectNeteaseApi}/dj/program/detail?id=${id}`;
+                try {
+                    const programRes = await axios.get(programDetailUrl);
+                    const mainSong = programRes.data.program.mainSong;
+                    id = mainSong.id;
+                    title = mainSong.name;
+                    desc = mainSong.artists[0].name || '喵喵~';
+                } catch (error) {
+                    logger.error('出现错误，无法上传', error);
+                    e.reply('出现错误，无法上传');
+                    return;
+                }
+            }
+
+            // 优先判断本地是否有文件
+            let path = this.getCurDownloadPath(e) + '/' + desc + '-' + title + '.' + FileSuffix;
+            let fileExists = await checkFileExists(path);
+
+            if (!fileExists) {
+                logger.mark(`[R插件][云盘] 未检测到本地文件，尝试自动下载...`);
+                const AUTO_NETEASE_SONG_DOWNLOAD = autoSelectNeteaseApi + "/song/url/v1?id=" + id + "&level=" + this.neteaseCloudAudioQuality;
+                try {
+                    const resp = await axios.get(AUTO_NETEASE_SONG_DOWNLOAD, {
+                        headers: {
+                            "User-Agent": COMMON_USER_AGENT,
+                            "Cookie": this.getCookie(false)
+                        }
+                    });
+                    let url = resp.data.data?.[0]?.url;
+                    let musicExt = resp.data.data?.[0]?.type || FileSuffix;
+                    path = await downloadAudio(url, this.getCurDownloadPath(e), desc + '-' + title, 'follow', musicExt);
+                } catch (err) {
+                    logger.error('获取歌曲下载链接失败', err);
+                    e.reply('获取歌曲下载链接失败，无法上传');
+                    return;
+                }
+            }
+
+            uploadFilePath = path;
+            matchSongId = id;
         }
-        let path = this.getCurDownloadPath(e) + '/' + desc + '-' + title + '.' + FileSuffix
-        const fileExists = await this.waitForFile(path, e);
-        if (!fileExists) {
-            return;
-        }
+
+        if (!uploadFilePath) return;
+
         const tryUpload = async () => {
             let formData = new FormData();
-            formData.append('songFile', fs.createReadStream(path));
+            formData.append('songFile', fs.createReadStream(uploadFilePath));
             const headers = {
                 ...formData.getHeaders(),
                 'Cookie': this.getCookie(true),
@@ -443,9 +547,9 @@ export class songRequest extends plugin {
                     data: formData,
                 });
                 if (res.data.code == 200) {
-                    let matchUrl = `${autoSelectNeteaseApi}/cloud/match?uid=${this.cloudUid || this.uid}&sid=${res.data.privateCloud.songId}&asid=${id}`;
+                    let matchUrl = `${autoSelectNeteaseApi}/cloud/match?uid=${this.cloudUid || this.uid}&sid=${res.data.privateCloud.songId}&asid=${matchSongId}`;
                     try {
-                        const matchRes = await axios.get(matchUrl, {
+                        await axios.get(matchUrl, {
                             headers: {
                                 "User-Agent": COMMON_USER_AGENT,
                                 "Cookie": this.getCookie(true)
@@ -466,7 +570,7 @@ export class songRequest extends plugin {
             }
         };
         await retryAxiosReq(() => tryUpload())
-        await checkAndRemoveFile(path)
+        await checkAndRemoveFile(uploadFilePath)
     }
 
     // 获取云盘歌单
@@ -485,11 +589,13 @@ export class songRequest extends plugin {
                             "Cookie": this.getCookie(true)
                         }
                     });
-                    const songs = res.data.data.map(({ songId, songName, artist }) => ({
+                    const songs = res.data.data.map(({ songId, songName, artist, simpleSong }) => ({
                         'songName': songName,
                         'id': songId,
                         'singerName': artist || '喵喵~',
-                        'duration': '云盘'
+                        'duration': formatTime(simpleSong.dt),
+                        'cover': simpleSong.al.picUrl || 'def',
+                        'type': 'cloud'
                     }));
                     songList.push(...songs);
                     if (!res.data.hasMore) {
@@ -508,91 +614,6 @@ export class songRequest extends plugin {
             return songList;
         }
     }
-
-    // 群文件上传云盘
-    async getLatestDocument(e) {
-        const autoSelectNeteaseApi = await this.pickApi();
-        const result = await getGroupFileUrl(e);
-        // 检查返回值有效性
-        if (!result || !result.cleanPath) {
-            e.reply('未找到群文件，请先在群内发送音频文件再使用此命令');
-            return;
-        }
-        let { cleanPath, file_id, fileName: extractedFileName, fileFormat: extractedFormat } = result;
-        // NapCat 和 LLBot 解决方案
-        if (cleanPath.startsWith("https")) {
-            const songName = extractedFileName || file_id.match(/\.(.*?)\.(\w+)$/)?.[1];
-            const format = extractedFormat || file_id.match(/\.(.*?)\.(\w+)$/)?.[2];
-            // 检测文件是否存在 已提升性能
-            if (await checkFileExists(cleanPath)) {
-                // 如果文件已存在
-                logger.mark(`[R插件][云盘] 上传路径审计：已存在下载文件`);
-                cleanPath = `${this.getCurDownloadPath(e)}/${songName}.${format}`;
-            } else {
-                // 如果文件不存在
-                logger.mark(`[R插件][云盘] 上传路径审计：不存在下载文件，将进行下载...`);
-                cleanPath = await downloadAudio(cleanPath, this.getCurDownloadPath(e), songName, "manual", format);
-            }
-        }
-        logger.info(`[R插件][云盘] 上传路径审计： ${cleanPath}`);
-        // 使用 splitPaths 提取信息
-        const [{ dir: dirPath, fileName, extension, baseFileName }] = splitPaths(cleanPath);
-        // 文件名拆解为两部分
-        const parts = baseFileName.trim().match(/^([\s\S]+)\s*-\s*([\s\S]+)$/);
-        // 命令不规范检测
-        if (parts == null || parts.length < 2) {
-            logger.warn("[R插件][云盘] 上传路径审计：命名不规范");
-            e.reply("请规范上传文件的命名：歌手-歌名，例如：梁静茹-勇气");
-            return true;
-        }
-        // 生成新文件名
-        const newFileName = `${dirPath}/${parts[2].trim()}${extension}`;
-        // 进行元数据编辑
-        if (parts) {
-            const tags = {
-                title: parts[2].replace(/^\s+|\s+$/g, ''),
-                artist: parts[1].replace(/^\s+|\s+$/g, '')
-            };
-            // 写入元数据
-            let success = NodeID3.write(tags, cleanPath)
-            if (fs.existsSync(newFileName)) {
-                logger.info(`音频已存在`);
-                fs.unlinkSync(newFileName);
-            }
-            // 文件重命名
-            fs.renameSync(cleanPath, newFileName)
-            if (success) logger.info('写入元数据成功')
-        } else {
-            logger.info('未按照标准命名')
-        }
-        // 上传请求
-        const tryUpload = async () => {
-            let formData = new FormData()
-            await formData.append('songFile', fs.createReadStream(newFileName))
-            const headers = {
-                ...formData.getHeaders(),
-                'Cookie': this.getCookie(true),
-            };
-            const updateUrl = autoSelectNeteaseApi + `/cloud?time=${Date.now()}`
-            try {
-                const res = await axios({
-                    method: 'post',
-                    url: updateUrl,
-                    headers: headers,
-                    data: formData,
-                });
-                this.songCloudUpdate(e);
-                return res;
-
-            } catch (error) {
-                throw error;
-            }
-        };
-        // 重试
-        await retryAxiosReq(() => tryUpload())
-        checkAndRemoveFile(newFileName)
-    }
-
 
     // 清除缓存
     async cleanCloudData(e) {
@@ -748,12 +769,18 @@ export class songRequest extends plugin {
             try {
                 // 发送卡片
                 const song = songInfo[pickNumber];
-                if (song.type === 'podcast') { //播客声音貌似只能用自定义卡片
-                    const musicurl = `https://music.163.com/dj?id=${song.programId}&userid=`; //暂时不知道怎么弄到userid(似乎也用不上)
+                if (song.type === 'podcast') { // 播客声音貌似只能用自定义音乐卡片
+                    const musicurl = `https://music.163.com/dj?id=${song.programId}&userid=`; // 暂时不知道怎么弄到userid(似乎也用不上)
+                    const musicaudio = resp.data.data[0].url;
+                    const musictitle = `声音：${song.songName}`;
+                    const musicimage = song.cover;
+                    await sendCustomMusicCard(e, musicurl, musicaudio, musictitle, musicimage, '163');
+                } else if (song.type === 'cloud') { // 云盘可能不为官方歌曲 也使用自定义音乐卡片
+                    const musicurl = `https://music.163.com/song?id=${song.id}`; // 由于可能不为官方歌曲 所以id指向不一定正确
                     const musicaudio = resp.data.data[0].url;
                     const musictitle = song.songName;
-                    const musicimage = song.cover;
-                    await sendCustomMusicCard(e, musicurl, musicaudio, musictitle, musicimage);
+                    const musicimage = (song.cover && song.cover !== 'def') ? song.cover : 'https://p2.music.126.net/UeTuwE7pvjBpypWLudqukA==/3132508627578625.jpg';
+                    await sendCustomMusicCard(e, musicurl, musicaudio, musictitle, musicimage, '163');
                 } else {
                     await sendMusicCard(e, '163', song.id);
                 }

@@ -15,6 +15,7 @@ import {
     BILI_CDN_SELECT_LIST,
     BILI_DEFAULT_INTRO_LEN_LIMIT,
     BILI_RESOLUTION_LIST,
+    XHS_DESC_LEN_LIMIT,
     COMMON_USER_AGENT,
     DIVIDING_LINE,
     douyinTypeMap,
@@ -90,6 +91,7 @@ import {
     cleanFilename,
     downloadAudio,
     downloadImg,
+    downloadImageViaProxy,
     downloadM3u8Video,
     estimateReadingTime,
     formatBiliInfo,
@@ -103,7 +105,7 @@ import { convertFlvToMp4, mergeVideoWithAudio } from "../utils/ffmpeg-util.js";
 import { checkAndRemoveFile, checkFileExists, deleteFolderRecursive, findFirstMp4File, getMediaFilesAndOthers, mkdirIfNotExists } from "../utils/file.js";
 import GeneralLinkAdapter from "../utils/general-link-adapter.js";
 import { contentEstimator } from "../utils/link-share-summary-util.js";
-import { deepSeekChat, llmRead } from "../utils/llm-util.js";
+import { llmRead } from "../utils/llm-util.js";
 import { getDS } from "../utils/mihoyo.js";
 import { OpenaiBuilder } from "../utils/openai-builder.js";
 import { redisExistAndGetKey, redisExistKey, redisGetKey, redisSetKey } from "../utils/redis-util.js";
@@ -168,7 +170,7 @@ export class tools extends plugin {
                     fnc: "trans",
                 },
                 {
-                    reg: "((v|live).douyin.com|webcast.amemv.com|www.douyin.com/(video|note|live|share|jingxuan|discover))",
+                    reg: "((v|live).douyin.com|webcast.amemv.com|iesdouyin.com|www.douyin.com/(video|note|live|share|jingxuan|discover))",
                     fnc: "douyin",
                 },
                 {
@@ -238,7 +240,7 @@ export class tools extends plugin {
                     fnc: "freyr"
                 },
                 {
-                    reg: "(^#总结一下\s*(http|https):\/\/.*|mp.weixin.qq.com|arxiv.org|sspai.com|chinadaily.com.cn|zhihu.com)",
+                    reg: "(^#总结一下\\s*(http|https):\\/\\/.*|mp.weixin.qq.com|arxiv.org|sspai.com|chinadaily.com.cn|zhihu.com|v2ex.com)",
                     fnc: "linkShareSummary"
                 },
                 {
@@ -351,8 +353,12 @@ export class tools extends plugin {
         this.youtubeCookiePath = this.toolsConfig.youtubeCookiePath;
         // 加载抖音Cookie
         this.douyinCookie = this.toolsConfig.douyinCookie;
+        // 加载抖音的限制时长
+        this.douyinDuration = this.toolsConfig.douyinDuration;
         // 加载抖音是否压缩
         this.douyinCompression = this.toolsConfig.douyinCompression;
+        // 加载抖音是否显示封面
+        this.douyinDisplayCover = this.toolsConfig.douyinDisplayCover ?? true;
         // 加载抖音是否开启评论
         this.douyinComments = this.toolsConfig.douyinComments;
         // 加载抖音是否开启背景音乐
@@ -425,7 +431,7 @@ export class tools extends plugin {
             logger.info(`[R插件][全局解析控制] ${RESOLVE_CONTROLLER_NAME_ENUM.douyin} 已拦截`);
             return false;
         }
-        const urlRex = /(http:\/\/|https:\/\/)((v|live).douyin.com\/[A-Za-z\d._?%&+\-=\/#]*|webcast.amemv.com\/[A-Za-z\d._?%&+\-=\/#]*|www.douyin.com\/((video|note|live)\/[0-9]+|share\/slides\/[0-9]+|(jingxuan|discover)\?[A-Za-z\d._?%&+\-=\/#]*modal_id=[0-9]+[A-Za-z\d._?%&+\-=\/#]*))/;
+        const urlRex = /(http:\/\/|https:\/\/)((v|live).douyin.com\/[A-Za-z\d._?%&+\-=\/#]*|webcast.amemv.com\/[A-Za-z\d._?%&+\-=\/#]*|(www\.)?iesdouyin.com\/[A-Za-z\d._?%&+\-=\/#]*|www.douyin.com\/((video|note|live)\/[0-9]+|share\/slides\/[0-9]+|(jingxuan|discover)\?[A-Za-z\d._?%&+\-=\/#]*modal_id=[0-9]+[A-Za-z\d._?%&+\-=\/#]*))/;
         // 检测无效链接，例如：v.douyin.com，静默忽略
         if (!urlRex.test(e.msg)) {
             return false;
@@ -443,6 +449,12 @@ export class tools extends plugin {
             const detailIdMatch = douUrl.match(/\/slides\/(\d+)/);
             const detailId = detailIdMatch[1];
 
+            // 当前版本需要填入cookie
+            if (_.isEmpty(this.douyinCookie)) {
+                e.reply(`检测到没有Cookie，无法解析抖音${HELP_DOC}`);
+                return;
+            }
+
             // 构建请求头
             const headers = {
                 "Accept-Language": "zh-CN,zh;q=0.8,zh-TW;q=0.7,zh-HK;q=0.5,en-US;q=0.3,en;q=0.2",
@@ -450,7 +462,6 @@ export class tools extends plugin {
                 Referer: "https://www.douyin.com/",
                 cookie: this.douyinCookie,
             };
-
 
             const dyApi = DY_INFO.replace("{}", detailId);
             const abParam = aBogus.generate_a_bogus(
@@ -471,7 +482,14 @@ export class tools extends plugin {
 
                 const desc = item.desc || "无简介";
                 const authorNickname = item.author?.nickname || "未知作者";
-                e.reply(`${this.identifyPrefix}识别：抖音动图，作者：${authorNickname}\n📝 简介：${desc}`);
+                // 封面
+                const dyCover = item.video?.cover?.url_list?.[0] || item.images?.[0]?.url_list?.[0];
+                const dySendContent = `${this.identifyPrefix}识别：抖音动图，作者：${authorNickname}\n📝 简介：${desc}`;
+                if (this.douyinDisplayCover && dyCover) {
+                    await replyWithRetry(e, Bot, [segment.image(dyCover), dySendContent]);
+                } else {
+                    e.reply(dySendContent);
+                }
 
                 // 调用动图函数处理
                 await this.processDouyinImageAlbum(e, item, douUrl, headers, detailId);
@@ -520,7 +538,13 @@ export class tools extends plugin {
             const item = webcastData.data.room;
             const { title, cover, user_count, stream_url } = item;
             const dySendContent = `${this.identifyPrefix}识别：抖音直播，${title}`;
-            await replyWithRetry(e, Bot, [segment.image(cover?.url_list?.[0]), dySendContent, `\n🏄‍♂️在线人数：${user_count}人正在观看`]);
+            // 封面
+            const dyCover = cover.url_list?.at(-1) || cover.url_list?.[0];
+            if (this.douyinDisplayCover && dyCover) {
+                await replyWithRetry(e, Bot, [segment.image(dyCover), dySendContent, `\n🏄‍♂️在线人数：${user_count}人正在观看`]);
+            } else {
+                e.reply(dySendContent, `\n🏄‍♂️在线人数：${user_count}人正在观看`);
+            }
             // 下载10s的直播流
             await this.sendStreamSegment(e, stream_url?.flv_pull_url?.HD1 || stream_url?.flv_pull_url?.FULL_HD1 || stream_url?.flv_pull_url?.SD1 || stream_url?.flv_pull_url?.SD2);
             return;
@@ -549,7 +573,13 @@ export class tools extends plugin {
                 const item = await data.data.data?.[0];
                 const { title, cover, user_count_str, stream_url } = item;
                 const dySendContent = `${this.identifyPrefix}识别：抖音直播，${title}`;
-                await replyWithRetry(e, Bot, [segment.image(cover?.url_list?.[0]), dySendContent, `\n🏄‍♂️在线人数：${user_count_str}人正在观看`]);
+                // 封面
+                const dyCover = cover.url_list?.at(-1) || cover.url_list?.[0];
+                if (this.douyinDisplayCover && dyCover) {
+                    await replyWithRetry(e, Bot, [segment.image(dyCover), dySendContent, `\n🏄‍♂️在线人数：${user_count_str}人正在观看`]);
+                } else {
+                    e.reply(dySendContent, `\n🏄‍♂️在线人数：${user_count_str}人正在观看`);
+                }
                 // 下载10s的直播流
                 await this.sendStreamSegment(e, stream_url?.flv_pull_url?.HD1 || stream_url?.flv_pull_url?.FULL_HD1 || stream_url?.flv_pull_url?.SD1 || stream_url?.flv_pull_url?.SD2);
                 return;
@@ -570,7 +600,7 @@ export class tools extends plugin {
                 const { play_addr: { uri: videoAddrURI }, duration, cover } = item.video;
                 // 进行时间判断，如果超过时间阈值就不发送
                 const dyDuration = Math.trunc(duration / 1000);
-                const durationThreshold = this.biliDuration;
+                const durationThreshold = this.douyinDuration;
                 // 一些共同发送内容
                 let dySendContent = `${this.identifyPrefix}识别：抖音，${item.author.nickname}\n📝 简介：${item.desc}`;
                 if (dyDuration >= durationThreshold) {
@@ -585,7 +615,13 @@ export class tools extends plugin {
                     await this.douyinComment(e, douId, headers);
                     return;
                 }
-                e.reply(`${dySendContent}`);
+                // 封面
+                const dyCover = cover.url_list?.at(-1) || cover.url_list?.[0];
+                if (this.douyinDisplayCover && dyCover) {
+                    await replyWithRetry(e, Bot, [segment.image(dyCover), dySendContent]);
+                } else {
+                    e.reply(dySendContent);
+                }
                 // 分辨率判断是否压缩
                 const resolution = this.douyinCompression ? "720p" : "1080p";
                 // 使用今日头条 CDN 进一步加快解析速度
@@ -608,6 +644,8 @@ export class tools extends plugin {
                 await this.downloadVideo(resUrl, false, null, this.videoDownloadConcurrency, 'douyin.mp4').then((videoPath) => {
                     this.sendVideoToUpload(e, videoPath);
                 });
+                // 如果开启评论的话就调用
+                await this.douyinComment(e, douId, headers);
             } else if (urlType === "image") {
                 // 检查是否包含video字段
                 const hasVideo = item.images?.some(img => img.video?.play_addr_h264?.uri || img.video?.play_addr?.uri);
@@ -616,7 +654,14 @@ export class tools extends plugin {
                     // 如果有 按照动图处理
                     const desc = item.desc || "无简介";
                     const authorNickname = item.author?.nickname || "未知作者";
-                    e.reply(`${this.identifyPrefix}识别：抖音动图，作者：${authorNickname}\n📝 简介：${desc}`);
+                    // 封面
+                    const dyCover = item.video?.cover?.url_list?.[0] || item.images?.[0]?.url_list?.[0];
+                    const dySendContent = `${this.identifyPrefix}识别：抖音动图，作者：${authorNickname}\n📝 简介：${desc}`;
+                    if (this.douyinDisplayCover && dyCover) {
+                        await replyWithRetry(e, Bot, [segment.image(dyCover), dySendContent]);
+                    } else {
+                        e.reply(dySendContent);
+                    }
 
                     // 调用动图处理函数
                     await this.processDouyinImageAlbum(e, item, douUrl, headers, douId);
@@ -739,7 +784,7 @@ export class tools extends plugin {
 
         // 下载BGM
         let bgmPath = null;
-        if (item.music?.play_url?.uri) {
+        if (!isOriginalSound && item.music?.play_url?.uri) {
             try {
                 const fileName = `douyin_bgm_${Date.now()}`;
                 const bgmUrl = item.music.play_url.url_list?.[0] || item.music.play_url.uri;
@@ -755,26 +800,26 @@ export class tools extends plugin {
         const messageSegments = [];
         const downloadedFilePaths = [];
 
-        // 并发处理所有动图
+        // 顺序处理所有动图
         const processImage = async (imageItem, index) => {
             try {
+                const videoUri = imageItem.video?.play_addr_h264?.uri || imageItem.video?.play_addr?.uri;
                 // 检查是否有video字段（动图）
-                if (imageItem.video?.play_addr_h264?.uri || imageItem.video?.play_addr?.uri) {
+                if (videoUri) {
                     // 动图：下载视频并与BGM合并
-                    const videoUri = imageItem.video.play_addr_h264?.uri || imageItem.video.play_addr?.uri;
-                    const videoUrl = `https://aweme.snssdk.com/aweme/v1/play/?video_id=${videoUri}&ratio=1080p&line=0`;
+                    // 分辨率判断是否压缩
+                    const resolution = this.douyinCompression ? "720p" : "1080p";
+                    // 使用今日头条 CDN 进一步加快解析速度
+                    const videoUrl = DY_TOUTIAO_INFO.replace("1080p", resolution).replace("{}", videoUri);
 
-                    logger.info(`[R插件][抖音动图] 下载动图视频 ${index + 1}: ${videoUrl}`);
+                    logger.info(`[R插件][抖音动图] 下载动图 ${index + 1}: ${videoUrl}`);
 
                     // 使用内置下载方法 带重试逻辑
                     let videoPath = null;
                     const maxRetries = 3;
                     for (let retry = 0; retry < maxRetries; retry++) {
                         try {
-                            videoPath = await this.downloadVideo(videoUrl, false, {
-                                'User-Agent': COMMON_USER_AGENT,
-                                'Referer': 'https://www.douyin.com/'
-                            }, this.videoDownloadConcurrency, `douyin_gif_${index}_${Date.now()}.mp4`);
+                            videoPath = await this.downloadVideo(videoUrl, false, null, this.videoDownloadConcurrency, `douyin_gif_${index}_${Date.now()}.mp4`);
                             if (videoPath) break;
                         } catch (downloadErr) {
                             logger.warn(`[R插件][抖音动图] 第${index + 1}个视频下载失败，重试 ${retry + 1}/${maxRetries}`);
@@ -841,10 +886,14 @@ export class tools extends plugin {
             return null;
         };
 
-        // 并行执行所有动图处理
-        const results = await Promise.all(
-            images.map((imageItem, index) => processImage(imageItem, index))
-        );
+        // 顺序执行所有动图处理
+        const results = [];
+        for (let index = 0; index < images.length; index++) {
+            const res = await processImage(images[index], index);
+            if (res) {
+                results.push(res);
+            }
+        }
 
         // 按原顺序整理结果
         for (const result of results) {
@@ -1126,6 +1175,9 @@ export class tools extends plugin {
             });
         } else if (url.includes("www.bilibili.com")) {
             url = urlRex.exec(url)[0];
+        } else if (url.includes("live.bilibili.com")) {
+            const liveRex = /(?:https?:\/\/)?live\.bilibili\.com\/[A-Za-z\d._?%&+\-=\/#]*/g;
+            url = liveRex.exec(url)[0];
         }
         // 补充https
         url = url.startsWith("https://") ? url : "https://" + url;
@@ -1995,6 +2047,40 @@ export class tools extends plugin {
         return true;
     }
 
+    /**
+     * 发送小红书描述预览，并在描述过长时补发完整内容。
+     *
+     * 发送顺序固定为：先等待预览消息发送完成，再发送完整合并转发。
+     * 视频笔记可通过 prefixMsg 把封面图放在预览消息最前面，普通图文笔记不传即可。
+     *
+     * @param {Object} e - 消息事件对象，用于回复消息和构造合并转发节点
+     * @param {string} title - 笔记标题，会拼进预览和完整转发的头部文案
+     * @param {string} desc - 笔记描述原文；为空时按空字符串处理
+     * @param {Array} prefixMsg - 预览消息前置内容，如 [segment.image(cover)]；只影响预览，不进入完整转发
+     * @param {number} maxLen - 描述预览长度限制；超过该长度时预览截断并补发完整转发
+     * @returns {Promise<void>} 仅负责发送消息，不返回发送结果
+     */
+    async sendXhsDescPreview(e, title, desc, prefixMsg = [], maxLen = XHS_DESC_LEN_LIMIT) {
+        // 接口偶尔可能不返回 desc，这里统一转成字符串，避免后续 length 判断报错
+        const fullDesc = String(desc ?? "");
+        // 预览消息和完整转发共用同一个头部，避免两处文案不一致
+        const header = `${this.identifyPrefix}识别：小红书, ${title}`;
+        // prefixMsg 只放进预览消息，例如视频封面；完整转发只保留标题和原始描述
+        const previewMsg = [...prefixMsg, `${header}\n${truncateString(fullDesc, maxLen)}`];
+
+        // 必须等待预览先发出，防止完整转发先于预览抵达
+        await replyWithRetry(e, Bot, previewMsg.length === 1 ? previewMsg[0] : previewMsg);
+
+        // 描述未超长时，预览已经包含完整内容，不再额外发送合并转发
+        if (fullDesc.length <= maxLen) {
+            return;
+        }
+
+        // 超长描述用合并转发承载全文，避免普通消息过长影响可读性或发送成功率
+        const forwardMsg = await Bot.makeForwardMsg(textArrayToMakeForward(e, [header, fullDesc]));
+        await replyWithRetry(e, Bot, forwardMsg);
+    }
+
     // 小红书解析
     async xhs(e) {
         // 切面判断是否需要解析
@@ -2075,7 +2161,7 @@ export class tools extends plugin {
         if (type === "video") {
             // 封面
             const cover = noteData.imageList?.[0].urlDefault;
-            await replyWithRetry(e, Bot, [segment.image(cover), `${this.identifyPrefix}识别：小红书, ${title}\n${desc}`]);
+            await this.sendXhsDescPreview(e, title, desc, [segment.image(cover)]);
             // ⚠️ （暂时废弃）构造xhs视频链接（有水印）
             const xhsVideoUrl = noteData.video.media.stream.h264?.[0]?.masterUrl;
 
@@ -2090,7 +2176,7 @@ export class tools extends plugin {
             });
             return true;
         } else if (type === "normal") {
-            e.reply(`${this.identifyPrefix}识别：小红书, ${title}\n${desc}`);
+            await this.sendXhsDescPreview(e, title, desc);
             const imagePromises = [];
             // 使用 for..of 循环处理异步下载操作
             for (let [index, item] of noteData.imageList.entries()) {
@@ -2767,7 +2853,7 @@ export class tools extends plugin {
                         const commentMsgs = comments.map(c => ({
                             message: `${c.text}\n${c.like}👍 · ${c.time}${c.source ? ' ' + c.source : ''}`,
                             nickname: c.user,
-                            user_id: c.uid || e.user_id
+                            user_id: 1 || e.user_id
                         }));
                         await e.reply(await Bot.makeForwardMsg(commentMsgs));
                     }
@@ -2878,7 +2964,7 @@ export class tools extends plugin {
                         return {
                             message: { type: 'text', text: msgText },
                             nickname: userName,
-                            user_id: comment.user?.id || e.user_id
+                            user_id: 1 || e.user_id
                         };
                     });
 
@@ -3017,50 +3103,68 @@ export class tools extends plugin {
             // 获取缩略图URL（不下载到本地）
             const thumbnailUrl = await ytDlpGetThumbnailUrl(url, isOversea, this.myProxy, this.youtubeCookiePath);
 
+            // 非海外环境通过代理下载缩略图到本地，避免 i.ytimg.com 被墙导致发送失败
+            let thumbnailSegment;
+            let thumbnailLocalPath = null;
+            if (!isOversea && thumbnailUrl) {
+                try {
+                    thumbnailLocalPath = await downloadImageViaProxy(thumbnailUrl, path, this.myProxy, `yt_thumb_${Date.now()}.jpg`);
+                    thumbnailSegment = segment.image(await fs.promises.readFile(thumbnailLocalPath));
+                    logger.info(`[R插件][油管] 缩略图已通过代理下载到本地: ${thumbnailLocalPath}`);
+                } catch (thumbErr) {
+                    logger.warn(`[R插件][油管] 代理下载缩略图失败，将跳过缩略图: ${thumbErr.message}`);
+                    thumbnailSegment = null;
+                }
+            } else {
+                thumbnailSegment = thumbnailUrl ? segment.image(thumbnailUrl) : null;
+            }
+
             // 清理可能存在的旧文件
             await checkAndRemoveFile(`${path}/${videoFilename}`);
             await checkAndRemoveFile(`${path}/${audioFilename}`);
 
-            // 音频逻辑
-            if (url.includes("music")) {
-                await replyWithRetry(e, Bot, [
-                    segment.image(thumbnailUrl),
-                    `${this.identifyPrefix}识别：油管音乐\n视频标题：${rawTitle}`
-                ]);
-                await ytDlpHelper(path, url, isOversea, this.myProxy, this.videoDownloadConcurrency, 'youtube', true, graphics, timeRange, this.youtubeCookiePath, this.videoCodec);
-                const fullAudioPath = `${path}/${audioFilename}`;
-                if (this.isSendVocal) {
-                    await e.reply(segment.record(fullAudioPath));
+            try {
+                // 音频逻辑
+                if (url.includes("music")) {
+                    const musicMsg = thumbnailSegment
+                        ? [thumbnailSegment, `${this.identifyPrefix}识别：油管音乐\n视频标题：${rawTitle}`]
+                        : `${this.identifyPrefix}识别：油管音乐\n视频标题：${rawTitle}`;
+                    await replyWithRetry(e, Bot, musicMsg);
+                    await ytDlpHelper(path, url, isOversea, this.myProxy, this.videoDownloadConcurrency, 'youtube', true, graphics, timeRange, this.youtubeCookiePath, this.videoCodec);
+                    const fullAudioPath = `${path}/${audioFilename}`;
+                    if (this.isSendVocal) {
+                        await e.reply(segment.record(fullAudioPath));
+                    }
+                    await this.uploadGroupFile(e, fullAudioPath);
+                    return;
                 }
-                await this.uploadGroupFile(e, fullAudioPath);
-                return;
-            }
 
-            // 下面为视频逻辑
-            const Duration = convertToSeconds((await ytDlpGetDuration(url, isOversea, this.myProxy, this.youtubeCookiePath)).toString().replace(/\n/g, ''));
+                // 下面为视频逻辑
+                const Duration = convertToSeconds((await ytDlpGetDuration(url, isOversea, this.myProxy, this.youtubeCookiePath)).toString().replace(/\n/g, ''));
 
-            if (Duration > this.youtubeDuration) {
-                // 超时限制
-                await replyWithRetry(e, Bot, [
-                    segment.image(thumbnailUrl),
-                    `${this.identifyPrefix}识别：油管，视频时长超限 \n视频标题：${rawTitle}\n⌚${DIVIDING_LINE.replace('{}', '限制说明').replace(/\n/g, '')}⌚\n视频时长：${(Duration / 60).toFixed(2).replace(/\.00$/, '')} 分钟\n大于管理员限定解析时长：${(this.youtubeDuration / 60).toFixed(2).replace(/\.00$/, '')} 分钟`
-                ]);
-            } else if (Duration > this.youtubeClipTime && timeRange != '00:00:00-00:00:00') {
-                // 截取模式
-                await replyWithRetry(e, Bot, [
-                    segment.image(thumbnailUrl),
-                    `${this.identifyPrefix}识别：油管，视频截取中请耐心等待 \n视频标题：${rawTitle}\n✂️${DIVIDING_LINE.replace('{}', '截取说明').replace(/\n/g, '')}✂️\n视频时长：${(Duration / 60).toFixed(2).replace(/\.00$/, '')} 分钟\n大于管理员限定截取时长：${(this.youtubeClipTime / 60).toFixed(2).replace(/\.00$/, '')} 分钟\n将截取视频片段`
-                ]);
-                await ytDlpHelper(path, url, isOversea, this.myProxy, this.videoDownloadConcurrency, 'youtube', true, graphics, timeRange, this.youtubeCookiePath, this.videoCodec);
-                await this.sendVideoToUpload(e, `${path}/${videoFilename}`);
-            } else {
-                // 正常下载
-                await replyWithRetry(e, Bot, [
-                    segment.image(thumbnailUrl),
-                    `${this.identifyPrefix}识别：油管，视频下载中请耐心等待 \n视频标题：${rawTitle}\n视频时长：${(Duration / 60).toFixed(2).replace(/\.00$/, '')} 分钟`
-                ]);
-                await ytDlpHelper(path, url, isOversea, this.myProxy, this.videoDownloadConcurrency, 'youtube', true, graphics, timeRange, this.youtubeCookiePath, this.videoCodec);
-                await this.sendVideoToUpload(e, `${path}/${videoFilename}`);
+                if (Duration > this.youtubeDuration) {
+                    // 超时限制
+                    const overLimitText = `${this.identifyPrefix}识别：油管，视频时长超限 \n视频标题：${rawTitle}\n⌚${DIVIDING_LINE.replace('{}', '限制说明').replace(/\n/g, '')}⌚\n视频时长：${(Duration / 60).toFixed(2).replace(/\.00$/, '')} 分钟\n大于管理员限定解析时长：${(this.youtubeDuration / 60).toFixed(2).replace(/\.00$/, '')} 分钟`;
+                    const overLimitMsg = thumbnailSegment ? [thumbnailSegment, overLimitText] : overLimitText;
+                    await replyWithRetry(e, Bot, overLimitMsg);
+                } else if (Duration > this.youtubeClipTime && timeRange != '00:00:00-00:00:00') {
+                    // 截取模式
+                    const clipText = `${this.identifyPrefix}识别：油管，视频截取中请耐心等待 \n视频标题：${rawTitle}\n✂️${DIVIDING_LINE.replace('{}', '截取说明').replace(/\n/g, '')}✂️\n视频时长：${(Duration / 60).toFixed(2).replace(/\.00$/, '')} 分钟\n大于管理员限定截取时长：${(this.youtubeClipTime / 60).toFixed(2).replace(/\.00$/, '')} 分钟\n将截取视频片段`;
+                    const clipMsg = thumbnailSegment ? [thumbnailSegment, clipText] : clipText;
+                    await replyWithRetry(e, Bot, clipMsg);
+                    await ytDlpHelper(path, url, isOversea, this.myProxy, this.videoDownloadConcurrency, 'youtube', true, graphics, timeRange, this.youtubeCookiePath, this.videoCodec);
+                    await this.sendVideoToUpload(e, `${path}/${videoFilename}`);
+                } else {
+                    // 正常下载
+                    const normalText = `${this.identifyPrefix}识别：油管，视频下载中请耐心等待 \n视频标题：${rawTitle}\n视频时长：${(Duration / 60).toFixed(2).replace(/\.00$/, '')} 分钟`;
+                    const normalMsg = thumbnailSegment ? [thumbnailSegment, normalText] : normalText;
+                    await replyWithRetry(e, Bot, normalMsg);
+                    await ytDlpHelper(path, url, isOversea, this.myProxy, this.videoDownloadConcurrency, 'youtube', true, graphics, timeRange, this.youtubeCookiePath, this.videoCodec);
+                    await this.sendVideoToUpload(e, `${path}/${videoFilename}`);
+                }
+            } finally {
+                // 统一清理缩略图临时文件，确保异常时也不会残留
+                if (thumbnailLocalPath) await checkAndRemoveFile(thumbnailLocalPath);
             }
         } catch (error) {
             logger.error(error);
@@ -3378,15 +3482,14 @@ export class tools extends plugin {
 
         if (e.msg.startsWith("#总结一下")) {
             name = "网页总结";
-            summaryLink = e.msg.replace("#总结一下", "");
+            summaryLink = e.msg.replace(/^#总结一下\s*/, "").trim();
         } else {
             ({ name, summaryLink } = contentEstimator(e.msg));
         }
 
         // 判断是否有总结的条件
         if (_.isEmpty(this.aiApiKey)) {
-            // e.reply(`没有配置 Kimi，无法为您总结！${ HELP_DOC }`)
-            await this.tempSummary(name, summaryLink, e);
+            e.reply(`未配置 AI 接口，无法为您总结内容！${HELP_DOC}`);
             return false;
         }
 
@@ -3395,10 +3498,6 @@ export class tools extends plugin {
             .setApiKey(this.aiApiKey)
             .setModel(this.aiModel)
             .setPrompt(SUMMARY_PROMPT);
-
-        if (this.aiModel.includes('deepseek')) {
-            builder.setProvider('deepseek');
-        }
 
         await builder.build();
 
@@ -3486,22 +3585,6 @@ export class tools extends plugin {
         }
         e.reply("处理超出限制，请重试");
         return false;
-    }
-
-    /**
-     * 临时AI接口
-     * @param name
-     * @param summaryLink
-     * @param e
-     * @returns {Promise<void>}
-     */
-    async tempSummary(name, summaryLink, e) {
-        const content = await llmRead(summaryLink);
-        const titleMatch = content.match(/Title:\s*(.*?)\n/)?.[1];
-        e.reply(`${this.identifyPrefix}识别：${name} - ${titleMatch}，正在为您总结，请稍等...`, true);
-        const summary = await deepSeekChat(content, SUMMARY_PROMPT);
-        const Msg = await Bot.makeForwardMsg(textArrayToMakeForward(e, [`「R插件 x DeepSeek」联合为您总结内容：`, summary]));
-        await replyWithRetry(e, Bot, Msg);
     }
 
     // q q m u s i c 解析
@@ -4156,7 +4239,7 @@ export class tools extends plugin {
                             commentForwardMsgs.push({
                                 message: commentContent,
                                 nickname: comment.user.username,
-                                user_id: comment.userid,
+                                user_id: 1 || e.user_id,
                             });
                             processedCommentCount++;
                         }

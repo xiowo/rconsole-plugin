@@ -25,3 +25,6 @@ bun.lockb
 .next
 CLAUDE.md
 .claude
+.ace-tool/
+AGENTS.md
+git-commit-message.md
